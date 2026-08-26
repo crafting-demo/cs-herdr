@@ -1,0 +1,6 @@
+# Your answers from ./setup.sh. Machine-specific, and may name a private org.
+cs-herdr.conf
+
+# Backups install.sh takes before it edits ~/.ssh/config, if run from here.
+*.bak
+*.tmp

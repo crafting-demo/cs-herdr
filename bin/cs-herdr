@@ -1,0 +1,472 @@
+#!/usr/bin/env bash
+#
+# cs-herdr -- Herdr on Crafting sandboxes.
+#
+# Installed on PATH as `cs-herdr`, which makes it reachable as `cs herdr`: the
+# cs CLI dispatches an unknown subcommand to an executable named cs-SUBCOMMAND.
+#
+# Two verbs, deliberately separate:
+#
+#   cs herdr new [NAME]   create a sandbox from the default template, attach
+#   cs herdr NAME         resume that sandbox if needed, attach; never creates
+#
+# A name `connect` does not know is an error and a list. It is never a silent
+# claim: an agent that lands in a brand new empty sandbox when it meant to
+# return to yesterday's work is a much worse outcome than a failed command.
+#
+# Also the ProxyCommand behind the `Host *.sandbox` block that install.sh
+# writes, as the hidden `__proxy` subcommand. In that mode stdout is the SSH
+# byte stream: nothing may be printed to it, so all logging goes to
+# ~/.cs-herdr/log/binder.log and only real failures go to stderr, where ssh
+# will show them.
+#
+set -euo pipefail
+
+# Herdr, ssh and cs all run helpers with environments that may lack Homebrew or
+# /opt on PATH.
+PATH="/opt/homebrew/bin:/usr/local/bin:/opt/sandboxd/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
+# Resolve through the install symlink to find the checkout, without readlink -f,
+# which macOS does not have.
+self="${BASH_SOURCE[0]}"
+while [ -L "$self" ]; do
+    target="$(readlink "$self")"
+    case "$target" in
+        /*) self="$target" ;;
+        *)  self="$(cd "$(dirname "$self")" && pwd)/$target" ;;
+    esac
+done
+CS_HERDR_ROOT="$(cd "$(dirname "$self")/.." && pwd)"
+export CS_HERDR_ROOT
+
+# shellcheck source=lib/config.sh
+. "$CS_HERDR_ROOT/lib/config.sh"
+
+require_cs
+resolve_config
+ensure_dirs
+LOG_FILE="$LOG_DIR/binder.log"
+trap 'rm -f "$ERR_FILE" 2>/dev/null || true' EXIT
+
+# shellcheck source=lib/sandbox.sh
+. "$CS_HERDR_ROOT/lib/sandbox.sh"
+
+# How long a resolved binding is trusted before it is checked against Crafting
+# again. Herdr opens several SSH connections per attach (platform probe, binary
+# probe, server start, the stdio bridge); re-validating each one would add a
+# round trip apiece to something the user is waiting on.
+: "${CS_HERDR_VERIFY_TTL:=300}"
+
+fail() {
+    log "ABORT $*"
+    printf 'cs-herdr: %s\n' "$*" >&2
+    exit 1
+}
+
+find_herdr() {
+    if [ -n "${CS_HERDR_BIN:-}" ] && [ -x "$CS_HERDR_BIN" ]; then
+        printf '%s' "$CS_HERDR_BIN"
+        return 0
+    fi
+    local candidate
+    for candidate in \
+        "$(command -v herdr 2>/dev/null || true)" \
+        "$HOME/.local/bin/herdr" \
+        /opt/homebrew/bin/herdr \
+        /usr/local/bin/herdr
+    do
+        [ -n "$candidate" ] && [ -x "$candidate" ] && { printf '%s' "$candidate"; return 0; }
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Names and aliases
+#
+# The SSH alias for a sandbox is NAME.SUFFIX, and WORKSPACE--NAME.SUFFIX when a
+# workspace other than the default is wanted. The `--` is Crafting's own
+# separator in real workspace hostnames, so the short form reads the same way.
+#
+# On the command line the same thing is spelled NAME/WORKSPACE, which is how cs
+# itself spells it (`cs ssh -W SANDBOX/WORKSPACE`).
+# ---------------------------------------------------------------------------
+
+# Split a NAME[/WORKSPACE] argument. Sets TARGET_NAME and TARGET_WORKSPACE.
+parse_target() {
+    local arg="$1"
+    case "$arg" in
+        */*) TARGET_NAME="${arg%%/*}"; TARGET_WORKSPACE="${arg#*/}" ;;
+        *)   TARGET_NAME="$arg";       TARGET_WORKSPACE="$CS_HERDR_WORKSPACE" ;;
+    esac
+    [ -n "$TARGET_NAME" ] || fail "no sandbox name given"
+    validate_name "$TARGET_NAME"
+}
+
+# Split an SSH alias. Sets TARGET_NAME and TARGET_WORKSPACE.
+parse_alias() {
+    local host="$1" body
+    body="${host%.$CS_HERDR_SUFFIX}"
+    if [ "$body" = "$host" ]; then
+        fail "'$host' is not a *.$CS_HERDR_SUFFIX alias; cs-herdr only handles those"
+    fi
+    case "$body" in
+        *--*) TARGET_WORKSPACE="${body%%--*}"; TARGET_NAME="${body#*--}" ;;
+        *)    TARGET_NAME="$body";             TARGET_WORKSPACE="$CS_HERDR_WORKSPACE" ;;
+    esac
+    [ -n "$TARGET_NAME" ] || fail "could not read a sandbox name out of '$host'"
+}
+
+alias_for() {
+    local name="$1" workspace="$2"
+    if [ "$workspace" = "$CS_HERDR_WORKSPACE" ]; then
+        printf '%s.%s' "$name" "$CS_HERDR_SUFFIX"
+    else
+        printf '%s--%s.%s' "$workspace" "$name" "$CS_HERDR_SUFFIX"
+    fi
+}
+
+# Crafting caps sandbox names at 20 characters and wants them lowercase and
+# dashed. Checking here means the error names the rule, instead of the platform
+# rejecting the create or quietly substituting a shortened name.
+validate_name() {
+    local name="$1"
+    case "$name" in
+        *[!a-z0-9-]*) fail "'$name' must be lowercase letters, digits and dashes only" ;;
+        -*|*-)        fail "'$name' cannot start or end with a dash" ;;
+    esac
+    [ "${#name}" -le 20 ] || fail "'$name' is ${#name} characters; Crafting caps sandbox names at 20"
+}
+
+require_template() {
+    [ -n "$CS_HERDR_TEMPLATE" ] \
+        || fail "no default template configured -- run ./setup.sh, or pass --template NAME"
+}
+
+require_org() {
+    [ -n "$CS_HERDR_ORG" ] \
+        || fail "no Crafting org configured -- run ./setup.sh, or set CS_HERDR_ORG"
+}
+
+# ---------------------------------------------------------------------------
+# Attach
+#
+# The last thing every verb does. exec, not a subshell, so Herdr owns the
+# terminal, the exit code, and the signals from here on.
+# ---------------------------------------------------------------------------
+
+attach() {
+    local name="$1" workspace="$2" herdr target
+    herdr="$(find_herdr)" || fail "herdr was not found on this machine -- install it from https://herdr.dev/"
+    target="$(alias_for "$name" "$workspace")"
+    last_used_write "$name"
+    log "ATTACH name=$name workspace=$workspace target=$target"
+    say "Attaching to $name ($workspace)"
+    exec "$herdr" --remote "$target"
+}
+
+# Confirm the sandbox is reachable before handing over to Herdr, and record the
+# binding so the ProxyCommand this is about to trigger can take its fast path.
+#
+# Doing it here rather than leaving it to the ProxyCommand is what makes the
+# failure legible: an unreachable sandbox says so, instead of surfacing as a
+# Herdr platform-detection error.
+prepare() {
+    local name="$1" workspace="$2" resolved
+    if ! resolved="$(resolve_sandbox "$name" "$workspace")" || [ -z "$resolved" ]; then
+        local reason
+        reason="$(cat "$ERR_FILE" 2>/dev/null || true)"
+        [ -n "$reason" ] && fail "$reason" || fail "could not reach sandbox '$name'"
+    fi
+    mark_verified "$name"
+}
+
+mark_verified() { : > "$BINDINGS_DIR/$1.ok" 2>/dev/null || true; }
+
+# True when this name was confirmed against Crafting recently enough to trust
+# the cached hostname without asking again.
+verified_recently() {
+    local name="$1" marker="$BINDINGS_DIR/$1.ok"
+    [ -f "$marker" ] || return 1
+    [ -n "$(find "$marker" -maxdepth 0 -mmin -$((CS_HERDR_VERIFY_TTL / 60 + 1)) 2>/dev/null)" ]
+}
+
+# ---------------------------------------------------------------------------
+# cs herdr NAME -- connect
+# ---------------------------------------------------------------------------
+
+cmd_connect() {
+    local arg="${1:-}"
+    require_org
+
+    if [ -z "$arg" ]; then
+        arg="$(last_used_read)"
+        if [ -z "$arg" ]; then
+            say "No sandbox used from this machine yet."
+            say ""
+            say "  cs herdr new          make one and attach"
+            say "  cs herdr NAME         attach to one you already have"
+            say ""
+            cmd_ls
+            exit 1
+        fi
+        say "Last used: $arg"
+    fi
+
+    parse_target "$arg"
+
+    # An unknown name stops here. Creating one would be the wrong kind of
+    # helpful: `new` is one word away, and a silent claim hides a typo behind a
+    # sandbox that looks right and contains nothing.
+    if ! sandbox_exists "$TARGET_NAME"; then
+        printf "cs-herdr: no sandbox named '%s' in %s/%s\n" \
+            "$TARGET_NAME" "$CS_HERDR_ORG" "$CS_HERDR_FOLDER" >&2
+        printf "cs-herdr: 'cs herdr new %s' would create it. What you have now:\n\n" "$TARGET_NAME" >&2
+        cmd_ls
+        exit 1
+    fi
+
+    prepare "$TARGET_NAME" "$TARGET_WORKSPACE"
+    attach "$TARGET_NAME" "$TARGET_WORKSPACE"
+}
+
+# ---------------------------------------------------------------------------
+# cs herdr new [NAME] -- create, then connect
+# ---------------------------------------------------------------------------
+
+cmd_new() {
+    local name="" template="" workspace=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --template|-t) template="${2:-}"; shift 2 ;;
+            --template=*)  template="${1#*=}"; shift ;;
+            --workspace|-W) workspace="${2:-}"; shift 2 ;;
+            --workspace=*)  workspace="${1#*=}"; shift ;;
+            -*) fail "unknown flag '$1' -- see 'cs herdr help'" ;;
+            *)  [ -z "$name" ] || fail "only one name can be given"; name="$1"; shift ;;
+        esac
+    done
+
+    # Check what was typed before what was configured: a malformed name is the
+    # user's immediate mistake, and reporting a missing template first would
+    # send them to setup.sh over a typo.
+    [ -n "$name" ] && validate_name "$name"
+
+    require_org
+    [ -n "$template" ] || template="$CS_HERDR_TEMPLATE"
+    [ -n "$template" ] || require_template
+    [ -n "$workspace" ] || workspace="$CS_HERDR_WORKSPACE"
+
+    if [ -n "$name" ]; then
+        # Refuse rather than adopt. Attaching to an existing sandbox is what
+        # `cs herdr NAME` is for, and doing it here would make `new` a command
+        # whose meaning depends on history.
+        if sandbox_exists "$name"; then
+            fail "a sandbox named '$name' already exists -- 'cs herdr $name' attaches to it"
+        fi
+    else
+        name="$(generate_name)"
+    fi
+
+    say "Creating $name from template $template"
+    if ! claim_sandbox "$name" "$template"; then
+        fail "could not create sandbox '$name' from template '$template'. Check 'cs herdr status', and that the template exists."
+    fi
+
+    prepare "$name" "$workspace"
+    attach "$name" "$workspace"
+}
+
+# ---------------------------------------------------------------------------
+# __proxy -- the ProxyCommand
+#
+#   Host *.sandbox
+#     ProxyCommand cs-herdr __proxy %n
+#
+# Resolves the alias to a workspace hostname, resuming the sandbox if Crafting
+# suspended it, then hands the connection to `cs ssh-proxy` and gets out of the
+# way. `cs ssh -W` resumes but opens a shell; raw `cs ssh-proxy` does not resume
+# at all. This is the piece that closes that gap, which is what makes clicking
+# a long-idle sandbox in any SSH client work.
+# ---------------------------------------------------------------------------
+
+cmd_proxy() {
+    local host="${1:-}"
+    [ -n "$host" ] || fail "usage: cs-herdr __proxy HOST"
+    require_org
+
+    parse_alias "$host"
+
+    local start resolved id hostname rc used_cache began elapsed
+    start=$(date +%s)
+    log "PROXY alias=$host name=$TARGET_NAME workspace=$TARGET_WORKSPACE"
+
+    hostname=""
+    used_cache=0
+    if verified_recently "$TARGET_NAME"; then
+        hostname="$(binding_host "$TARGET_NAME")"
+        # A binding is per sandbox, not per workspace, so it can only be reused
+        # when the workspace matches the one it was built for.
+        case "$hostname" in
+            "$TARGET_WORKSPACE"--*) used_cache=1; log "CACHED name=$TARGET_NAME host=$hostname" ;;
+            *) hostname="" ;;
+        esac
+    fi
+
+    if [ -z "$hostname" ]; then
+        hostname="$(proxy_resolve "$host")"
+        log "RESOLVED name=$TARGET_NAME host=$hostname secs=$(( $(date +%s) - start ))"
+    fi
+
+    began=$(date +%s)
+    set +e
+    "$CS_BIN" ssh-proxy "$hostname:443"
+    rc=$?
+    set -e
+    [ "$rc" -eq 0 ] && exit 0
+
+    elapsed=$(( $(date +%s) - began ))
+    log "PROXY exit alias=$host rc=$rc secs=$elapsed"
+    binding_forget "$TARGET_NAME"
+    rm -f "$BINDINGS_DIR/$TARGET_NAME.ok" 2>/dev/null || true
+
+    # Retry here rather than leaving it to the caller, because the caller does
+    # not retry: Herdr reports "remote platform detection failed" and stops. The
+    # case this exists for is ordinary -- the sandbox was reachable when it was
+    # cached and Crafting has suspended it since, which is precisely what the
+    # short name is supposed to hide.
+    #
+    # Only after a cached hostname, and only if the proxy died quickly enough
+    # that it cannot have carried any SSH bytes. A tunnel that ran a while and
+    # then dropped was a real session, and reconnecting underneath ssh would
+    # splice a fresh stream into a conversation already in progress.
+    if [ "$used_cache" = 1 ] && [ "$elapsed" -lt 15 ]; then
+        log "RETRY alias=$host -- full resolve"
+        hostname="$(proxy_resolve "$host")"
+        log "RETRY resolved host=$hostname"
+        set +e
+        "$CS_BIN" ssh-proxy "$hostname:443"
+        rc=$?
+        set -e
+        [ "$rc" -ne 0 ] && log "RETRY exit alias=$host rc=$rc"
+    fi
+
+    exit "$rc"
+}
+
+# Resolve to a connectable hostname or abort with the reason. Never falls back
+# to another sandbox: connecting an alias to anything but its own sandbox would
+# put an agent's work somewhere the user is not looking, which is far worse than
+# a failed connection.
+proxy_resolve() {
+    local host="$1" resolved reason
+    if ! resolved="$(resolve_sandbox "$TARGET_NAME" "$TARGET_WORKSPACE")" || [ -z "$resolved" ]; then
+        reason="$(cat "$ERR_FILE" 2>/dev/null || true)"
+        [ -n "$reason" ] && fail "$reason" || fail "could not resolve '$host'"
+    fi
+    mark_verified "$TARGET_NAME"
+    printf '%s' "${resolved##* }"
+}
+
+# ---------------------------------------------------------------------------
+# Lifecycle
+# ---------------------------------------------------------------------------
+
+cmd_ls() {
+    local name state host any=0
+    printf '%-22s %-10s %s\n' SANDBOX STATE HOST
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        any=1
+        state="$(sandbox_state "$name")"
+        host="$(binding_host "$name")"
+        printf '%-22s %-10s %s\n' "$name" "${state:-gone}" "$host"
+    done <<EOF
+$(binding_names)
+EOF
+    [ "$any" = 1 ] || printf '  (none from this machine yet -- try: cs herdr new)\n'
+}
+
+cmd_rm() {
+    local name="${1:-}" delete="${2:-}"
+    [ -n "$name" ] || fail "usage: cs herdr rm NAME [--delete]"
+    [ -n "$(binding_id "$name")" ] || fail "no binding for '$name' on this machine"
+    binding_forget "$name"
+    rm -f "$BINDINGS_DIR/$name.ok" 2>/dev/null || true
+    [ "$(last_used_read)" = "$name" ] && rm -f "$CS_HERDR_HOME/last-used" 2>/dev/null || true
+    say "forgot $name"
+    if [ "$delete" = "--delete" ]; then
+        if cs_run sandbox remove "$name" -f --skip-non-exist >/dev/null 2>&1; then
+            say "deleted sandbox $name"
+        else
+            warn "could not delete sandbox $name"
+        fi
+    else
+        say "the sandbox itself was left alone; pass --delete to remove it too"
+    fi
+}
+
+cmd_set_template() {
+    local name="${1:-}"
+    [ -n "$name" ] || fail "usage: cs herdr set-template NAME"
+    require_org
+    if ! cs_run template show "$name" -o json >/dev/null 2>&1; then
+        fail "no template named '$name' in $CS_HERDR_ORG/$CS_HERDR_FOLDER -- 'cs template list' shows yours"
+    fi
+    conf_set CS_HERDR_TEMPLATE "$name"
+    say "new sandboxes will be built from '$name'"
+    say "existing sandboxes keep whatever they were built from"
+}
+
+cmd_status() {
+    printf 'cs-herdr\n'
+    printf '  %-24s %s\n' checkout "$CS_HERDR_ROOT"
+    config_show
+    printf '  %-24s %s\n' bindings "$(binding_count)"
+    printf '  %-24s %s\n' "last used" "$(last_used_read || echo '(none)')"
+    printf '  %-24s %s\n' herdr "$(find_herdr || echo '(not found)')"
+    printf '  %-24s %s\n' cs "$CS_BIN"
+    printf '  %-24s %s\n' log "$LOG_FILE"
+}
+
+usage() {
+    cat >&2 <<EOF
+cs-herdr -- Herdr on Crafting sandboxes
+
+  cs herdr new [NAME]            create a sandbox from the default template,
+                                 then attach. --template NAME overrides it once
+  cs herdr NAME[/WORKSPACE]      resume that sandbox if needed, then attach.
+                                 Never creates
+  cs herdr                       the sandbox you used last
+
+  cs herdr ls                    your sandboxes and their state
+  cs herdr rm NAME [--delete]    forget a name; optionally delete its sandbox
+  cs herdr set-template NAME     change what 'new' builds from, from now on
+  cs herdr status                the resolved settings
+
+Plain 'herdr --remote NAME.$CS_HERDR_SUFFIX' also works, and resumes the sandbox,
+because setup.sh installs a Host *.$CS_HERDR_SUFFIX block in ~/.ssh/config.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+
+main() {
+    local sub="${1:-}"
+    case "$sub" in
+        __proxy)          shift; cmd_proxy "$@" ;;
+        new|create)       shift; cmd_new "$@" ;;
+        connect|attach)   shift; cmd_connect "${1:-}" ;;
+        ls|list)          shift; cmd_ls ;;
+        rm|forget)        shift; cmd_rm "$@" ;;
+        set-template)     shift; cmd_set_template "${1:-}" ;;
+        status)           shift; cmd_status ;;
+        help|--help|-h)   usage ;;
+        "")               cmd_connect "" ;;
+        -*)               fail "unknown flag '$sub' -- see 'cs herdr help'" ;;
+        # A bare word is a sandbox name, so `cs herdr payments-fix` reads the
+        # way it should.
+        *)                cmd_connect "$sub" ;;
+    esac
+}
+
+main "$@"
