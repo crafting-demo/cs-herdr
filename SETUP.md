@@ -36,10 +36,11 @@ first if it is missing. Say so rather than silently skipping it.
 Show them what they have with `cs template list`. Two ways to answer:
 
 - **They name a template.** Use it. It must have the `herdr` binary installed
-  and a `herdr server` daemon running as `owner` — read
-  `examples/herdr-worker.yaml`, which explains both requirements and why. If
-  their template does not meet them, offer to add the two pieces to it, and say
-  what you would be changing before you change anything of theirs.
+  and a `herdr server` daemon running as `owner`, started with `setsid -f -w`
+  so the process is a session leader — read `examples/herdr-worker.yaml`, which
+  explains both requirements and why. If their template does not meet them,
+  offer to add the two pieces to it, and say what you would be changing before
+  you change anything of theirs.
 - **They have nothing suitable, or are not sure.** Use the bundled example:
   `./setup.sh --example` creates it as a template named `herdr-worker`.
 

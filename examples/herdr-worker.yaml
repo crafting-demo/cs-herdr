@@ -15,12 +15,17 @@
 #      detection instead of prompting. Installing at create time also means the
 #      cost is paid once per pooled sandbox rather than on every first attach.
 #
-#   2. `herdr server` is running as a daemon, as the owner user.
+#   2. `herdr server` is running as a daemon, as the owner user, and as a
+#      session leader (`setsid -f -w herdr server`).
 #
 #      This is what makes an agent outlive you. The server owns the panes, so
 #      agents keep working after you detach, close the laptop, or lose the
 #      network -- and the session is there to come back to even if nobody has
 #      attached to this sandbox yet.
+#
+#      The session-leader part is what `herdr --remote` checks. Without it the
+#      client thinks the server will die on SSH loss and prompts to restart
+#      it on every attach.
 #
 workspaces:
   - name: dev
@@ -85,7 +90,14 @@ workspaces:
                           [ -x "$HOME/.local/bin/herdr" ] && break
                           sleep 5
                         done
-                        exec "$HOME/.local/bin/herdr" server
+                        # herdr --remote only treats a running server as
+                        # disconnect-safe when that process is a session
+                        # leader (getsid == pid). A bare `herdr server` under
+                        # Crafting's supervisor is not, so every attach
+                        # prompts to restart it. setsid -f makes herdr the
+                        # leader; -w keeps this process alive so Crafting
+                        # still supervises it.
+                        exec setsid -f -w "$HOME/.local/bin/herdr" server
                       # The server outlives any one project, so it runs from
                       # home rather than from this checkout.
                       dir: /home/owner

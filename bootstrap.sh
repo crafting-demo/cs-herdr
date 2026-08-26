@@ -4,12 +4,12 @@
 # few sandboxes warm on it.
 #
 #   ./bootstrap.sh                 use the configured template, create the pool
-#   ./bootstrap.sh --example       create examples/herdr-worker.yaml as a template first
+#   ./bootstrap.sh --example       create or refresh examples/herdr-worker.yaml as a template
 #   ./bootstrap.sh --no-pool       template only, no warm pool
 #   ./bootstrap.sh --min N         how many warm sandboxes to keep (default 1)
 #
-# Safe to re-run: an existing template is left alone and an existing pool is
-# reported rather than replaced.
+# Safe to re-run: --example refreshes the bundled template from the yaml in
+# this checkout; an existing pool is reported rather than replaced.
 #
 set -euo pipefail
 
@@ -47,13 +47,15 @@ cs_logged_in || die "cs is not logged in -- run 'cs login' first"
 EXAMPLE_TEMPLATE_NAME="herdr-worker"
 
 if [ "$WANT_EXAMPLE" = 1 ]; then
+    say "Validating examples/herdr-worker.yaml"
+    cs_run template validate "$CS_HERDR_ROOT/examples/herdr-worker.yaml" \
+        || die "the example template did not validate against this site"
     if cs_run template show "$EXAMPLE_TEMPLATE_NAME" -o json >/dev/null 2>&1; then
-        say "Template '$EXAMPLE_TEMPLATE_NAME' already exists; leaving it as it is."
-        warn "To replace it: cs -O $CS_HERDR_ORG --folder $CS_HERDR_FOLDER template update $EXAMPLE_TEMPLATE_NAME $CS_HERDR_ROOT/examples/herdr-worker.yaml"
+        say "Updating template '$EXAMPLE_TEMPLATE_NAME' from examples/herdr-worker.yaml"
+        cs_run template update "$EXAMPLE_TEMPLATE_NAME" "$CS_HERDR_ROOT/examples/herdr-worker.yaml" \
+            || die "could not update the template"
+        warn "already-running sandboxes and pooled instances still use the previous daemon; new ones pick this up"
     else
-        say "Validating examples/herdr-worker.yaml"
-        cs_run template validate "$CS_HERDR_ROOT/examples/herdr-worker.yaml" \
-            || die "the example template did not validate against this site"
         say "Creating template '$EXAMPLE_TEMPLATE_NAME' in $CS_HERDR_ORG/$CS_HERDR_FOLDER"
         cs_run template create "$EXAMPLE_TEMPLATE_NAME" "$CS_HERDR_ROOT/examples/herdr-worker.yaml" \
             || die "could not create the template"
