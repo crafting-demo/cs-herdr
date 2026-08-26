@@ -1,28 +1,25 @@
 # cs-herdr
 
-Run [Herdr](https://herdr.dev/) on Crafting sandboxes. Two commands: one makes a
-new sandbox and sits you down at it, one takes you back to a sandbox you already
-have. Agents keep working in the sandbox after you detach, close the laptop, or
-lose the network.
+Run [Herdr](https://herdr.dev/) on Crafting sandboxes. `cs herdr new` makes one
+and attaches; `cs herdr NAME` takes you back. Agents keep working after you
+detach, close the laptop, or lose the network.
 
-Installs as a `cs` CLI extension, so it is spelled `cs herdr`. Works with any
-Crafting site, self-hosted or not.
+A `cs` CLI extension, spelled `cs herdr`. Works with any Crafting site.
 
 ## Install
 
-You need the `cs` CLI logged in (`cs login`), `herdr` on this machine, `jq`, and
-a template in your Crafting org. macOS and Linux both work.
+Needs `cs` logged in (`cs login`), `herdr` on this machine, `jq`, and a template
+in your org. macOS and Linux.
 
 ```bash
 git clone https://github.com/crafting-demo/cs-herdr && cd cs-herdr
 ./setup.sh
 ```
 
-It asks which template new sandboxes should be built from, saves the answer,
-readies a warm pool, and wires up this machine. `./setup.sh --example` creates an
-example template first if you have none.
+Asks which template to build from, starts a warm pool, and wires this machine.
+`./setup.sh --example` creates a starter template if you have none.
 
-Or paste this into an agent chat, which comes to the same question:
+Or paste this into an agent chat:
 
 > Clone https://github.com/crafting-demo/cs-herdr and follow its SETUP.md to set
 > up Herdr on Crafting sandboxes for me.
@@ -36,54 +33,39 @@ cs herdr payments-fix        # back to that sandbox
 cs herdr                     # back to the last one you used
 ```
 
-`new` claims from the warm pool on the template you chose at setup and attaches.
-`cs herdr NAME` resumes the sandbox if Crafting suspended it and attaches. It
-never creates: a name it does not know is an error and a list, not a surprise
-empty sandbox.
+`new` claims from the warm pool. `cs herdr NAME` resumes if Crafting suspended
+the sandbox; it never creates — an unknown name is an error and a list.
 
-Detach with `ctrl+b q`. The herdr server keeps running inside the sandbox with
-your agents in it, and `cs herdr NAME` brings you back to the same panes.
+Detach with `ctrl+b q`. The herdr server keeps running; `cs herdr NAME` returns
+you to the same panes.
 
 ### What survives what
-
-Two different things are easy to conflate, so plainly:
 
 | | Agents keep running | Panes come back |
 | --- | --- | --- |
 | You detach, close the laptop, or lose the network | yes | yes |
 | Crafting suspends the idle sandbox | no | yes |
 
-Detaching costs you nothing: the sandbox is still running and so is everything
-in it. You can be gone for hours and walk back into work that continued without
-you.
+A Crafting **suspend** freezes the container. The herdr server restarts on wake
+and restores layout; processes inside panes are gone. Agent integrations
+(`herdr integration install claude`) can restore their own sessions; anything
+else you restart yourself. `cs herdr NAME` wakes a suspended sandbox.
 
-A Crafting **suspend** is a stop, not a detach. The container is frozen, so the
-herdr server restarts when the sandbox wakes. Herdr restores the workspaces,
-tabs and panes it had, but the processes that were inside them are gone. Where
-an agent integration is installed (`herdr integration install claude`), that
-agent can pick its own session back up; anything else you restart yourself.
-
-Crafting suspends sandboxes after a period of idleness, so this is the state a
-sandbox you have not touched since yesterday will be in. `cs herdr NAME` wakes
-it for you.
-
-Once you are attached, Herdr is ordinary Herdr: spaces, panes, and the agents
-you already run. `herdr` itself is how you (or an agent, through its CLI) open
-more spaces -- those live inside the one sandbox and do not each need their own.
+Once attached, Herdr is ordinary Herdr. Extra spaces are `herdr` commands inside
+the one sandbox, not extra sandboxes.
 
 ### The plain herdr command still works
 
-Setup installs one `Host *.sandbox` block in `~/.ssh/config`, so any SSH client
-can reach a sandbox by a short name, and the sandbox is resumed on connect:
+Setup installs `Host *.sandbox` in `~/.ssh/config`, so any SSH client can reach
+a sandbox by a short name and resume it on connect:
 
 ```bash
 herdr --remote payments-fix.sandbox
 herdr --remote db--payments-fix.sandbox   # a specific Crafting workspace
 ```
 
-`cs herdr NAME` is that command plus the resume-and-check, and is the one to
-reach for. The alias exists so `scp`, `git`, `rsync` and editors can use the same
-short name.
+`cs herdr NAME` is that plus the resume-and-check. The alias also works for
+`scp`, `git`, `rsync`, and editors.
 
 ## How it works
 
@@ -98,7 +80,7 @@ flowchart LR
     server --> agents["your agents"]
 ```
 
-Three things are all called some form of "workspace", and they are different:
+Three different "workspaces":
 
 | Layer | What it is | Who owns it |
 | --- | --- | --- |
@@ -106,9 +88,7 @@ Three things are all called some form of "workspace", and they are different:
 | Crafting workspace | a container in that sandbox | chosen at setup; `NAME/ws` to override |
 | Herdr space | a pane group inside the herdr server | you and your agents, after attach |
 
-There is no router sandbox and nothing per-agent. Herdr is already the thing
-that runs many agents on one machine, so one sandbox holds the whole herd, and
-Herdr's own sidebar is how you see them.
+One sandbox holds the whole herd. Herdr's sidebar is how you see them.
 
 ## Commands
 
@@ -126,20 +106,17 @@ Herdr's own sidebar is how you see them.
 
 ## Speed
 
-Claiming from a warm pool takes a few seconds; a cold build is a couple of
-minutes. Reconnecting to a running sandbox costs about a second, because the
-name-to-sandbox lookup is cached. Waking a suspended sandbox takes around twenty
-seconds, and `cs herdr NAME` absorbs that wait for you.
+Warm-pool claim: a few seconds. Cold build: a couple of minutes. Reconnect to a
+running sandbox: about a second. Wake a suspended one: about twenty seconds;
+`cs herdr NAME` waits for you.
 
-The `*.sandbox` ProxyCommand handles the wake itself, including when it only
-finds out the sandbox is asleep after the first connection fails. That matters
-because Herdr does not retry: it would otherwise report `remote platform
-detection failed` and stop.
+The `*.sandbox` ProxyCommand retries a wake after a cached hostname fails.
+Herdr itself does not retry, and would otherwise stop with `remote platform
+detection failed`.
 
-Herdr installs itself onto an unknown remote host, interactively, and refuses to
-in a non-interactive run -- which is what a ProxyCommand is. The worker template
-therefore ships `herdr` already installed and already running as a daemon. See
-[examples/herdr-worker.yaml](examples/herdr-worker.yaml).
+The worker template ships `herdr` already installed and running as a daemon,
+because Herdr will not install itself through a non-interactive ProxyCommand.
+See [examples/herdr-worker.yaml](examples/herdr-worker.yaml).
 
 ## Layout
 

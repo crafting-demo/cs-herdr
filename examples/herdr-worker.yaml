@@ -1,77 +1,46 @@
 ---
-# herdr-worker -- an example Crafting template for running Herdr.
+# herdr-worker -- example Crafting template for Herdr.
 #
-# Created by `./setup.sh --example` if you have no template of your own. It is
-# a starting point, not a fixed contract: edit it, or point cs-herdr at any
-# template you already have with `cs herdr set-template NAME`.
+# Created by `./setup.sh --example`. Starting point, not a contract: edit it,
+# or point cs-herdr at another template with `cs herdr set-template NAME`.
 #
-# A template is a Herdr worker if it satisfies two requirements:
+# A Herdr worker needs two things:
 #
-#   1. the `herdr` binary is already installed.
+#   1. `herdr` already installed. Remote attach is a ProxyCommand, so Herdr
+#      cannot prompt to install itself. Doing it at create time also pays the
+#      cost once per pooled sandbox, not on first attach.
 #
-#      Herdr can install itself onto a remote host, but it asks first, and
-#      declines when it cannot ask. An SSH ProxyCommand is not a terminal it
-#      can ask through, so an attach against a bare sandbox fails at platform
-#      detection instead of prompting. Installing at create time also means the
-#      cost is paid once per pooled sandbox rather than on every first attach.
-#
-#   2. `herdr server` is running as a daemon, as the owner user, and as a
-#      session leader (`setsid -f -w herdr server`).
-#
-#      This is what makes an agent outlive you. The server owns the panes, so
-#      agents keep working after you detach, close the laptop, or lose the
-#      network -- and the session is there to come back to even if nobody has
-#      attached to this sandbox yet.
-#
-#      The session-leader part is what `herdr --remote` checks. Without it the
-#      client thinks the server will die on SSH loss and prompts to restart
-#      it on every attach.
+#   2. `herdr server` running as owner, as a session leader
+#      (`setsid -f -w herdr server`). That keeps agents alive after detach.
+#      Without setsid, `herdr --remote` thinks the server will die on SSH loss
+#      and prompts to restart it on every attach.
 #
 workspaces:
   - name: dev
     description: Herdr worker -- runs the herdr server and the coding agents inside it.
 
-    # A public image that ships node, which the npm-installed agent CLIs below
-    # need. Swap in your org's own base image; nothing here depends on this one
-    # beyond node being present.
+    # Public image with node, which the agent CLIs below need. Swap freely.
     base_snapshot: oci://us-docker.pkg.dev/crafting-eng/pub/sandbox/workspace/default:latest
 
     env:
       - SHELL=/bin/bash
       - PATH=/usr/local/go/bin:/usr/local/node/bin:$HOME/.local/bin:$PATH
-      # Herdr keeps its config, logs and session state here.
-      - XDG_CONFIG_HOME=$HOME/.config
-      # Agents inherit this from their pane, and several of them render
-      # differently (or refuse colour) without it.
-      - TERM=xterm-256color
+      - XDG_CONFIG_HOME=$HOME/.config   # herdr config, logs, session state
+      - TERM=xterm-256color             # agents inherit this; some refuse colour without it
 
-      # Agent credentials.
-      #
-      # Uncomment the ones your org has secrets for. These come from org
-      # secrets rather than a device login on purpose: a pooled sandbox is
-      # created before anyone claims it, so there is nobody present to complete
-      # an interactive sign-in, and a warm sandbox that needs a login before it
-      # is useful is not warm.
-      #
-      # Create them with:  cs secret create anthropic-api-key --value ...
+      # Uncomment secrets your org has. Pooled sandboxes are created before
+      # anyone claims them, so device login cannot work.
+      #   cs secret create anthropic-api-key --value ...
       #
       # - ANTHROPIC_API_KEY=${secret:anthropic-api-key}
       # - OPENAI_API_KEY=${secret:openai-api-key}
 
     checkouts:
-      # Your project. Swap in your own repo, or drop this and clone by hand
-      # once attached.
-      #
-      # The herdr server daemon is attached to this checkout rather than
-      # declared under `system:`. Both start a background process, but a
-      # workspace-level system daemon runs as root, and Herdr would then put
-      # its socket and session state in root's home while you attach over SSH
-      # as `owner` -- you would get an empty second server instead of your
-      # agents. Daemons declared on a checkout run as the owner, which is the
-      # identity that has to own the panes.
-      #
-      # Keep the daemon block if you replace the repo below. If you delete the
-      # checkout entirely, move the daemon onto whichever checkout remains.
+      # Swap the repo, or drop this and clone by hand. Keep the daemon block:
+      # checkout daemons run as owner. A `system:` daemon runs as root, and
+      # Herdr would then put its socket in root's home -- you'd attach as
+      # owner and get an empty second server. If you delete this checkout,
+      # move the daemon onto whichever checkout remains.
       - path: hello
         repo:
           git: https://github.com/crafting-test1/hello
@@ -81,59 +50,39 @@ workspaces:
                 daemons:
                   herdr-server:
                     run:
-                      # Daemons start once the build completes, which can be
-                      # before on_create has finished installing Herdr. Waiting
-                      # for the binary rather than assuming it keeps the daemon
-                      # from failing its first start and backing off.
+                      # Build can finish before on_create installs herdr.
                       cmd: |
                         for _ in $(seq 1 120); do
                           [ -x "$HOME/.local/bin/herdr" ] && break
                           sleep 5
                         done
-                        # herdr --remote only treats a running server as
-                        # disconnect-safe when that process is a session
-                        # leader (getsid == pid). A bare `herdr server` under
-                        # Crafting's supervisor is not, so every attach
-                        # prompts to restart it. setsid -f makes herdr the
-                        # leader; -w keeps this process alive so Crafting
-                        # still supervises it.
+                        # Session leader so herdr --remote does not prompt.
+                        # -w keeps this process alive for Crafting to supervise.
                         exec setsid -f -w "$HOME/.local/bin/herdr" server
-                      # The server outlives any one project, so it runs from
-                      # home rather than from this checkout.
-                      dir: /home/owner
+                      dir: /home/owner   # not this checkout; the server outlives the project
                       env:
                         - TERM=xterm-256color
 
     lifecycle:
       on_create:
         run:
-          # Runs once per sandbox, as owner, in the home directory -- including
-          # for each sandbox a warm pool builds ahead of time, so a claim is
-          # usable the moment it lands.
+          # Once per sandbox, as owner, including pooled ones.
           cmd: |
             set -eu
 
-            # Herdr's installer puts the binary in ~/.local/bin, which is on
-            # PATH above.
             curl -fsSL https://herdr.dev/install.sh | sh
 
-            # The coding agents. Trim this to the ones you use; every one of
-            # them adds to the build time of every pooled sandbox.
+            # Trim to the agents you use; each one costs pool build time.
             npm install -g @anthropic-ai/claude-code --prefix "$HOME/.local" || true
             npm install -g @openai/codex --prefix "$HOME/.local" || true
 
-            # Integrations give Herdr native session restore for an agent, so a
-            # resumed sandbox brings the agent's own conversation back rather
-            # than only replaying the terminal it left behind. Install only the
-            # ones whose agent is actually installed above.
+            # Native session restore on resume. Install only for agents above.
             "$HOME/.local/bin/herdr" integration install claude || true
             "$HOME/.local/bin/herdr" integration install codex || true
         timeout: 900s
         max_retries: 2
 
 customizations:
-  # Leave processes running when the sandbox goes to standby, so a claimed or
-  # resumed sandbox is usable immediately instead of restarting the herdr
-  # server -- which would take the agents' panes with it.
+  # Keep processes across standby so a claim does not restart herdr (and its panes).
   - detach_env:
       enabled: true
