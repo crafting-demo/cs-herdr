@@ -50,6 +50,8 @@ trap 'rm -f "$ERR_FILE" 2>/dev/null || true' EXIT
 
 # shellcheck source=lib/sandbox.sh
 . "$CS_HERDR_ROOT/lib/sandbox.sh"
+# shellcheck source=lib/gui.sh
+. "$CS_HERDR_ROOT/lib/gui.sh"
 
 # How long a resolved binding is trusted before it is checked against Crafting
 # again. Herdr opens several SSH connections per attach (platform probe, binary
@@ -432,6 +434,12 @@ usage() {
     cat >&2 <<EOF
 cs-herdr -- Herdr on Crafting sandboxes
 
+  cs herdr gui NAME[/WORKSPACE]  add an existing sandbox to Herdr GUI, then open
+                                 --org ORG --folder FOLDER select its scope
+                                 --install allows installing remote hc
+                                 --name NAME sets its local machine name
+                                 --no-open connects without opening the GUI
+
   cs herdr new [NAME]            create a sandbox from the default template,
                                  then attach. --template NAME overrides it once
   cs herdr NAME[/WORKSPACE]      resume that sandbox if needed, then attach.
@@ -454,6 +462,8 @@ main() {
     local sub="${1:-}"
     case "$sub" in
         __proxy)          shift; cmd_proxy "$@" ;;
+        __exec)           shift; cmd_gui_exec "$@" ;;
+        gui)              shift; cmd_gui "$@" ;;
         new|create)       shift; cmd_new "$@" ;;
         connect|attach)   shift; cmd_connect "${1:-}" ;;
         ls|list)          shift; cmd_ls ;;
