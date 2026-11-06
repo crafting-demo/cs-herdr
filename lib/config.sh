@@ -189,7 +189,11 @@ discover_identity() {
 # ---------------------------------------------------------------------------
 
 resolve_config() {
-    resolve_one CS_HERDR_ORG       "$(discover_org || true)"
+    resolve_one CS_HERDR_ORG       ""
+    # Do not run org discovery when env/config already supplied it. Expanding
+    # a $(discover_org) fallback eagerly costs an API call on every transport
+    # start, including hc's probes and reconnects.
+    [ -n "$CS_HERDR_ORG" ] || CS_HERDR_ORG="$(discover_org || true)"
     resolve_one CS_HERDR_FOLDER    "${SANDBOX_FOLDER:-lab}"
 
     # No default template on purpose: creating from a guessed template would

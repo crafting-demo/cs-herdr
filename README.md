@@ -6,6 +6,62 @@ detach, close the laptop, or lose the network.
 
 A `cs` CLI extension, spelled `cs herdr`. Works with any Crafting site.
 
+## Herdr GUI and Core
+
+The desktop app uses `hc` (Herdr Core), a separate server from the older
+terminal `herdr`. The GUI does not import the old server's panes or agents.
+Install Herdr GUI and Core from [herdr.dev](https://herdr.dev/), log in with
+`cs login`, and connect an **existing** sandbox:
+
+```bash
+./bin/cs-herdr gui payments-fix/dev --org my-org --folder lab --install
+# With the extension already on PATH:
+cs herdr gui payments-fix/dev --org my-org --folder lab
+```
+
+`--install` permits `hc machine add` to install a compatible remote Core when
+it is missing or incompatible. Omit it if Core is already installed. No worker
+template, warm pool, `setup.sh`, or custom SSH config is required for this path.
+Crafting's login-managed SSH configuration and `cs ssh` provide the transport.
+
+The command validates the chosen workspace, resumes a suspended sandbox and
+waits for readiness **before** registering it with Core. The readiness timeout
+is 90 seconds; set `CS_HERDR_READY_TIMEOUT` to change it. A failed readiness wait
+does not proceed with registration or installation. This avoids spending
+Core 0.1.18's 20-second hello deadline on an initial sandbox wake.
+
+The machine name defaults to `SANDBOX-WORKSPACE`; use `--name NAME` to override
+it. Repeating the same command reuses its registration. After readiness, it
+waits up to 60 seconds for Core to report the machine connected; set
+`CS_HERDR_CONNECT_TIMEOUT` to change that limit. An existing registration still
+backing off after a failed handshake cannot report success early. A connection
+failure, required login or required update returns an error. `--no-open`
+connects without opening the GUI. Machines are registered without `--temp` because
+Herdr GUI 0.1.13 hides temporary machines. Select the machine when creating a
+space in Herdr, or use its CLI:
+
+```bash
+herdr-app do space.new '{"name":"payments","machine":"payments-fix-dev"}'
+hc exec --on payments-fix-dev uname -sm
+hc machine ls
+```
+
+The stored transport includes the org, folder, sandbox and workspace explicitly,
+so a later GUI launch does not depend on your shell's selected org. It calls
+`cs ssh -T` with batch authentication and SSH keepalives, carries stdin/stdout
+unchanged, and never retries underneath an existing SSH stream. Core owns
+reconnects and checks the remote core's identity. Later automatic wakes still
+have Core's per-attempt hello deadline: a slow wake can require several retries.
+Run `cs herdr gui ...` again to perform the longer readiness wait explicitly.
+Suspending a sandbox can end its processes; reconnect persistence is not a
+promise that processes survive suspension.
+
+Regression checks (mock transports, no remote changes):
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
 ## Install
 
 Needs `cs` logged in (`cs login`), `herdr` on this machine, `jq`, and a template
